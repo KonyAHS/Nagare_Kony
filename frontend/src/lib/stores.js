@@ -145,14 +145,63 @@ export function applyMiningConfig(mining = {}) {
 /**
  * @param {SubtitlePayload | null | undefined} payload
  */
-export function applySubtitlePayload(payload) {
-  subtitles.set(payload?.lines || []);
+let pendingSubtitleOffset = null;
+
+function shiftedLines(lines, deltaMs) {
+  if (!deltaMs) return lines;
+  return lines.map(line => ({
+    ...line,
+    start_ms: line.start_ms + deltaMs,
+    end_ms: line.end_ms + deltaMs,
+  }));
+}
+
+export function setOptimisticSubtitleOffset(historyId, candidateId, targetMs) {
+  const deltaMs = targetMs - get(subtitleOffsetMs);
+  pendingSubtitleOffset = { historyId, candidateId, targetMs };
+  subtitles.update(lines => shiftedLines(lines, deltaMs));
+  subtitleOffsetMs.set(targetMs);
+  syncActiveLineWithPosition();
+}
+
+export function clearPendingSubtitleOffset(historyId) {
+  if (pendingSubtitleOffset?.historyId === historyId) pendingSubtitleOffset = null;
+}
+
+export function applyServerSubtitleOffset(historyId, offsetMs) {
+  if (pendingSubtitleOffset?.historyId === historyId) {
+    if (pendingSubtitleOffset.targetMs === offsetMs) pendingSubtitleOffset = null;
+    else return;
+  }
+  const deltaMs = offsetMs - get(subtitleOffsetMs);
+  if (!deltaMs) return;
+  subtitles.update(lines => shiftedLines(lines, deltaMs));
+  subtitleOffsetMs.set(offsetMs);
+  syncActiveLineWithPosition();
+}
+
+export function applySubtitlePayload(payload, historyId = null) {
+  const offsetMs = payload?.subtitle_offset_ms ?? 0;
+  if (pendingSubtitleOffset?.historyId === historyId) {
+    if (pendingSubtitleOffset.candidateId !== (payload?.selected_candidate_id ?? null)
+      || offsetMs === pendingSubtitleOffset.targetMs) {
+      pendingSubtitleOffset = null;
+    }
+  }
+  const rebase = pendingSubtitleOffset
+    && !payload?.loading
+    && pendingSubtitleOffset.historyId === historyId
+    && pendingSubtitleOffset.candidateId === (payload?.selected_candidate_id ?? null)
+    ? pendingSubtitleOffset.targetMs - offsetMs
+    : 0;
+  subtitles.set(shiftedLines(payload?.lines || [], rebase));
   nativeSubtitles.set(payload?.native_lines || []);
   subtitleCandidates.set(payload?.candidates || []);
   selectedSubtitleCandidateId.set(payload?.selected_candidate_id ?? null);
   subtitleSelectionMode.set(payload?.selection_mode || 'auto');
-  subtitleOffsetMs.set(payload?.subtitle_offset_ms ?? 0);
+  subtitleOffsetMs.set(offsetMs + rebase);
   subtitleLoading.set(payload?.loading ?? false);
+  syncActiveLineWithPosition();
 }
 
 // Brief "✓" flash shown next to the connection status after a successful

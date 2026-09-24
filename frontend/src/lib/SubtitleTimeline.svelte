@@ -1,7 +1,7 @@
 <script>
   import { afterUpdate, onDestroy, tick } from 'svelte';
-  import { subtitles, nativeSubtitles, subtitleCandidates, selectedSubtitleCandidateId, subtitleSelectionMode, subtitleOffsetMs, subtitleLoading, activeHistoryItemId, activeLineIndex, timelineRecenterRequest, positionMs, pauseOnHover, pauseOnSeek, disableSubtitleSeeking, isPlaying, sessionState, showErrorToast, setOptimisticPosition, setOptimisticPlayState, applySubtitlePayload, yomitanPopupVisible, nowPlayingTitle, showNativeSubtitles, showDownloadButton } from './stores.js';
-  import { fireSeek, firePlayPause, playPause, selectSubtitleTrack, setSubtitleOffset } from './api.js';
+  import { subtitles, nativeSubtitles, subtitleCandidates, selectedSubtitleCandidateId, subtitleSelectionMode, subtitleOffsetMs, subtitleLoading, activeHistoryItemId, activeLineIndex, timelineRecenterRequest, positionMs, pauseOnHover, pauseOnSeek, disableSubtitleSeeking, isPlaying, sessionState, showErrorToast, setOptimisticPosition, setOptimisticPlayState, setOptimisticSubtitleOffset, clearPendingSubtitleOffset, applySubtitlePayload, yomitanPopupVisible, nowPlayingTitle, showNativeSubtitles, showDownloadButton } from './stores.js';
+  import { fireSeek, firePlayPause, playPause, selectSubtitleTrack, setSubtitleOffset, getSubtitles } from './api.js';
   import { formatTime, nativeLinesForRange } from './utils.js';
   import AudioTrackSelector from './AudioTrackSelector.svelte';
 
@@ -92,9 +92,10 @@
     const previousValue = subtitlePickerValue;
     const rawValue = select.value;
     const candidateId = rawValue === 'auto' ? null : rawValue;
-    subtitleLoading.set(true);
-
     try {
+      await flushOffset();
+      clearPendingSubtitleOffset($sessionState.now_playing?.history_id);
+      subtitleLoading.set(true);
       const result = await selectSubtitleTrack(candidateId);
       if (result?.ok === false) {
         throw new Error(result.error || 'Could not switch subtitle track');
@@ -107,7 +108,10 @@
     }
   }
 
-  let offsetBusy = false;
+  let offsetTimer;
+  let queuedOffset = null;
+  let queuedHistoryId = null;
+  let offsetFlushPromise = null;
 
   $: offsetSupported = !$activeHistoryItemId && !isSubtitleLoading && $subtitles.length > 0;
   $: offsetLabel = formatOffset($subtitleOffsetMs);
@@ -131,35 +135,57 @@
     nudgeOffset(direction * amount);
   }
 
-  async function nudgeOffset(deltaMs) {
-    if (offsetBusy || !offsetSupported) return;
-    offsetBusy = true;
-    try {
-      const result = await setSubtitleOffset({ deltaMs });
-      if (result?.ok === false) {
-        throw new Error(result.error || 'Failed to update offset');
-      }
-      applySubtitlePayload(result?.subtitles);
-    } catch (error) {
-      showErrorToast(error?.message || 'Failed to update subtitle offset');
-    } finally {
-      offsetBusy = false;
-    }
+  function queueOffset(targetMs) {
+    const historyId = $sessionState.now_playing?.history_id;
+    if (!historyId || !offsetSupported) return;
+    queuedOffset = targetMs;
+    queuedHistoryId = historyId;
+    setOptimisticSubtitleOffset(historyId, $selectedSubtitleCandidateId, targetMs);
+    clearTimeout(offsetTimer);
+    offsetTimer = setTimeout(() => { void flushOffset(); }, 150);
   }
 
-  async function resetOffset() {
-    if (offsetBusy || !offsetSupported || !$subtitleOffsetMs) return;
-    offsetBusy = true;
-    try {
-      const result = await setSubtitleOffset({ offsetMs: 0 });
-      if (result?.ok === false) {
-        throw new Error(result.error || 'Failed to reset offset');
+  function nudgeOffset(deltaMs) {
+    queueOffset($subtitleOffsetMs + deltaMs);
+  }
+
+  function resetOffset() {
+    if (offsetSupported && $subtitleOffsetMs) queueOffset(0);
+  }
+
+  async function flushOffset() {
+    clearTimeout(offsetTimer);
+    if (offsetFlushPromise) return offsetFlushPromise;
+    if (queuedOffset == null) return;
+    offsetFlushPromise = (async () => {
+      while (queuedOffset != null) {
+        const targetMs = queuedOffset;
+        const historyId = queuedHistoryId;
+        queuedOffset = null;
+        try {
+          const result = await setSubtitleOffset({ offsetMs: targetMs, historyId, compactResponse: true });
+          if (result?.ok !== true) throw new Error(result?.error || 'Failed to update offset');
+        } catch (error) {
+          showErrorToast(error?.message || 'Failed to update subtitle offset');
+          if (queuedOffset != null) continue;
+          clearPendingSubtitleOffset(historyId);
+          if ($sessionState.now_playing?.history_id === historyId) {
+            try {
+              const fresh = await getSubtitles();
+              if (queuedOffset == null && $sessionState.now_playing?.history_id === historyId) {
+                applySubtitlePayload(fresh, historyId);
+              }
+            } catch (_) { /* The next server update will restore the track. */ }
+          }
+          break;
+        }
       }
-      applySubtitlePayload(result?.subtitles);
-    } catch (error) {
-      showErrorToast(error?.message || 'Failed to reset subtitle offset');
+    })();
+    try {
+      await offsetFlushPromise;
     } finally {
-      offsetBusy = false;
+      offsetFlushPromise = null;
+      if (queuedOffset != null) void flushOffset();
     }
   }
 
@@ -263,6 +289,7 @@
   }
 
   onDestroy(() => {
+    void flushOffset();
     if (pausedByHover && remoteControlAvailable) {
       playPause(false);
       pausedByHover = false;
@@ -390,13 +417,13 @@
           <div class="offset-adjuster" role="group" aria-label="Subtitle timing offset">
             <span class="offset-label">Offset</span>
             <div class="offset-buttons">
-              <button type="button" class="offset-btn jump" on:click={() => snapLineToPosition('current')} disabled={offsetBusy || $activeLineIndex == null} title="Snap current subtitle to playback position">⏮</button>
-              <button type="button" class="offset-btn" data-dir="back" on:click={handleNudgeClick} disabled={offsetBusy} title="−100 ms (Shift: −500 ms)">◂</button>
-              <button type="button" class="offset-value" on:click={resetOffset} disabled={offsetBusy || !$subtitleOffsetMs} title={$subtitleOffsetMs ? 'Reset to 0' : 'No offset applied'}>
+              <button type="button" class="offset-btn jump" on:click={() => snapLineToPosition('current')} disabled={$activeLineIndex == null} title="Snap current subtitle to playback position">⏮</button>
+              <button type="button" class="offset-btn" data-dir="back" on:click={handleNudgeClick} title="−100 ms (Shift: −500 ms)">◂</button>
+              <button type="button" class="offset-value" on:click={resetOffset} disabled={!$subtitleOffsetMs} title={$subtitleOffsetMs ? 'Reset to 0' : 'No offset applied'}>
                 {offsetLabel}
               </button>
-              <button type="button" class="offset-btn" data-dir="fwd" on:click={handleNudgeClick} disabled={offsetBusy} title="+100 ms (Shift: +500 ms)">▸</button>
-              <button type="button" class="offset-btn jump" on:click={() => snapLineToPosition('next')} disabled={offsetBusy || $activeLineIndex == null || $activeLineIndex >= $subtitles.length - 1} title="Snap next subtitle to playback position">⏭</button>
+              <button type="button" class="offset-btn" data-dir="fwd" on:click={handleNudgeClick} title="+100 ms (Shift: +500 ms)">▸</button>
+              <button type="button" class="offset-btn jump" on:click={() => snapLineToPosition('next')} disabled={$activeLineIndex == null || $activeLineIndex >= $subtitles.length - 1} title="Snap next subtitle to playback position">⏭</button>
             </div>
           </div>
         {/if}

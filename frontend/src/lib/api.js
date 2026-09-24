@@ -43,13 +43,14 @@ export async function selectSubtitleTrack(candidateId = null) {
  * Pass `deltaMs` to nudge by a relative amount, or `offsetMs` for an absolute value.
  * `historyId` targets a specific past item; defaults to the active session.
  *
- * @param {{ offsetMs?: number, deltaMs?: number, historyId?: string|null }} args
+ * @param {{ offsetMs?: number, deltaMs?: number, historyId?: string|null, compactResponse?: boolean }} args
  */
-export async function setSubtitleOffset({ offsetMs = null, deltaMs = null, historyId = null } = {}) {
+export async function setSubtitleOffset({ offsetMs = null, deltaMs = null, historyId = null, compactResponse = false } = {}) {
   const body = {};
   if (offsetMs != null) body.offset_ms = offsetMs;
   if (deltaMs != null) body.delta_ms = deltaMs;
   if (historyId) body.history_id = historyId;
+  if (compactResponse) body.compact_response = true;
   return api('/api/subtitles/offset', {
     method: 'POST',
     body: JSON.stringify(body),

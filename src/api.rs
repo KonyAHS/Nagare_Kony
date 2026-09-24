@@ -274,7 +274,7 @@ async fn select_subtitle_track(
 
 #[derive(Deserialize)]
 struct SetSubtitleOffsetRequest {
-    /// Absolute offset in ms. If `delta_ms` is also given, this is treated as the previous offset.
+    /// Absolute offset in ms. `delta_ms` takes precedence when both are supplied.
     #[serde(default)]
     offset_ms: Option<i64>,
     /// Optional delta to apply on top of the current offset.
@@ -283,6 +283,10 @@ struct SetSubtitleOffsetRequest {
     /// Adjust the offset for a specific history item; defaults to the active item.
     #[serde(default)]
     history_id: Option<String>,
+    /// Browser timeline can use the lightweight response; keep the existing
+    /// full subtitle payload for other API clients by default.
+    #[serde(default)]
+    compact_response: bool,
 }
 
 async fn set_subtitle_offset(
@@ -304,18 +308,24 @@ async fn set_subtitle_offset(
         .await
     {
         Ok(new_offset) => {
-            // For history-only adjustments include a history payload, otherwise the active one.
-            let payload = if let Some(history_id) = target_id.as_deref() {
-                let track = state.subtitle_history.read().await.get(history_id).cloned();
-                history_subtitle_data(track)
+            if body.compact_response {
+                Json(serde_json::json!({
+                    "ok": true,
+                    "offset_ms": new_offset,
+                }))
             } else {
-                active_subtitle_data(&state).await
-            };
-            Json(serde_json::json!({
-                "ok": true,
-                "offset_ms": new_offset,
-                "subtitles": payload,
-            }))
+                let payload = if let Some(history_id) = target_id.as_deref() {
+                    let track = state.subtitle_history.read().await.get(history_id).cloned();
+                    history_subtitle_data(track)
+                } else {
+                    active_subtitle_data(&state).await
+                };
+                Json(serde_json::json!({
+                    "ok": true,
+                    "offset_ms": new_offset,
+                    "subtitles": payload,
+                }))
+            }
         }
         Err(error) => Json(serde_json::json!({
             "ok": false,
@@ -3230,10 +3240,10 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
             SubtitleSelectionMode,
             usize,
             Vec<SubtitleCandidate>,
-            i64,
             usize,
             bool,
         )> = None;
+        let mut last_subtitle_offset_ms: Option<i64> = None;
         let mut last_anki_status: Option<AnkiStatus> = None;
         let mut last_enhancement_queue: Vec<EnhancementQueueItem> = Vec::new();
         let mut last_audio_tracks: Option<AudioTracksData> = None;
@@ -3365,7 +3375,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                         .unwrap_or(false);
                     let current_subtitle_signature = (
                         current_item_id.clone(), selected_candidate_id.clone(), selection_mode,
-                        subtitle_count, current_candidates.clone(), subtitle_offset_ms,
+                        subtitle_count, current_candidates.clone(),
                         native_count, subtitle_loading,
                     );
 
@@ -3374,6 +3384,15 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                     last_item_id = current_item_id;
                     if send_subs {
                         last_subtitle_signature = Some(current_subtitle_signature);
+                        last_subtitle_offset_ms = Some(subtitle_offset_ms);
+                    }
+                    // Timing-only changes need no full subtitle payload. Wait until
+                    // the session snapshot and the track report the same offset.
+                    let send_offset = !send_subs
+                        && last_subtitle_offset_ms != Some(subtitle_offset_ms)
+                        && session_state.now_playing.as_ref().is_some_and(|np| np.subtitle_offset_ms == subtitle_offset_ms);
+                    if send_offset {
+                        last_subtitle_offset_ms = Some(subtitle_offset_ms);
                     }
                     let send_anki_status = last_anki_status.as_ref() != Some(&current_anki_status);
                     if send_anki_status {
@@ -3401,7 +3420,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                         None
                     };
 
-                    let subtitle_data = if send_subs {
+                    let subtitle_data = if send_subs || (send_audio && send_offset) {
                         Some(SubtitleData {
                             count: subtitle_count,
                             lines: subs.as_ref().map(|t| t.lines.clone()).unwrap_or_default(),
@@ -3418,7 +3437,9 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                     let is_full_update = send_subs || send_audio;
 
                     let msg = WsMessage {
-                        msg_type: if is_full_update { "full_update".to_string() } else { "position".to_string() },
+                        msg_type: if is_full_update { "full_update".to_string() }
+                            else if send_offset { "offset".to_string() }
+                            else { "position".to_string() },
                         state: Some(session_state),
                         subtitles: subtitle_data,
                         active_line_index: active_line,

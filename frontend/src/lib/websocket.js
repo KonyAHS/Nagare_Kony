@@ -1,6 +1,6 @@
 import { get } from 'svelte/store';
 import { confirmCardReceived, reviewRevision } from './stores.js';
-import { activeHistoryItemId, sessionState, pendingCards, connected, ankiStatus, enhancementQueue, syncPositionFromSessionState, isSeekLocked, isPlayLocked, applySubtitlePayload, applyAudioTracksPayload, showErrorToast, flashEnhancementSuccess, forceResync } from './stores.js';
+import { activeHistoryItemId, sessionState, pendingCards, connected, ankiStatus, enhancementQueue, syncPositionFromSessionState, isSeekLocked, isPlayLocked, applySubtitlePayload, applyServerSubtitleOffset, applyAudioTracksPayload, showErrorToast, flashEnhancementSuccess, forceResync } from './stores.js';
 
 let ws = null;
 let reconnectTimer = null;
@@ -114,13 +114,14 @@ function handleMessage(msg) {
         syncPositionFromSessionState(msg.state);
       }
       if (msg.subtitles && !get(activeHistoryItemId)) {
-        applySubtitlePayload(msg.subtitles);
+        applySubtitlePayload(msg.subtitles, msg.state?.now_playing?.history_id ?? null);
       }
       if (msg.audio_tracks) {
         applyAudioTracksPayload(msg.audio_tracks);
       }
       break;
 
+    case 'offset':
     case 'position':
       if (msg.state) {
         const cur = get(sessionState);
@@ -143,6 +144,12 @@ function handleMessage(msg) {
         // so rapid remote-control clicks accumulate correctly.
         if (!isSeekLocked()) {
           syncPositionFromSessionState(msg.state);
+        }
+        if (msg.type === 'offset' && !get(activeHistoryItemId)) {
+          applyServerSubtitleOffset(
+            msg.state.now_playing?.history_id ?? null,
+            msg.state.now_playing?.subtitle_offset_ms ?? 0,
+          );
         }
       }
       break;

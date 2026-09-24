@@ -41,6 +41,46 @@ function receive(state, type = 'position') {
   socket.onmessage({ data: JSON.stringify({ type, state }) });
 }
 
+test('an older subtitle update does not undo a pending timing nudge', () => {
+  const historyId = 'jellyfin|episode-1';
+  const subtitlePayload = (offset) => ({
+    lines: [{ index: 0, start_ms: 1_000 + offset, end_ms: 2_000 + offset, text: 'line' }],
+    selected_candidate_id: 'track-1',
+    subtitle_offset_ms: offset,
+  });
+
+  stores.sessionState.set(playback('device-1'));
+  stores.applySubtitlePayload(subtitlePayload(0), historyId);
+  stores.setOptimisticSubtitleOffset(historyId, 'track-1', 100);
+  assert.equal(get(stores.subtitleOffsetMs), 100);
+  assert.equal(get(stores.subtitles)[0].start_ms, 1_100);
+
+  const staleState = playback('device-1');
+  staleState.now_playing.subtitle_offset_ms = 0;
+  receive(staleState, 'offset');
+  assert.equal(get(stores.subtitleOffsetMs), 100);
+  assert.equal(get(stores.subtitles)[0].start_ms, 1_100);
+
+  socket.onmessage({ data: JSON.stringify({
+    type: 'full_update', state: playback('device-1'), subtitles: subtitlePayload(0),
+  }) });
+  assert.equal(get(stores.subtitleOffsetMs), 100);
+  assert.equal(get(stores.subtitles)[0].start_ms, 1_100);
+
+  socket.onmessage({ data: JSON.stringify({
+    type: 'full_update', state: playback('device-1'), subtitles: subtitlePayload(100),
+  }) });
+  assert.equal(get(stores.subtitleOffsetMs), 100);
+  assert.equal(get(stores.subtitles)[0].start_ms, 1_100);
+
+  const adjustedState = playback('device-1');
+  adjustedState.now_playing.subtitle_offset_ms = 200;
+  receive(adjustedState, 'offset');
+  assert.equal(get(stores.subtitleOffsetMs), 200);
+  assert.equal(get(stores.subtitles)[0].start_ms, 1_200);
+  stores.clearPendingSubtitleOffset(historyId);
+});
+
 beforeEach(() => {
   now += 10_000;
   stores.forceResync();

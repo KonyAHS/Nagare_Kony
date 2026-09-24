@@ -609,6 +609,9 @@ impl SessionManager {
         history_id: Option<&str>,
         absolute_offset_ms: i64,
     ) -> anyhow::Result<i64> {
+        // Keep overlapping updates and full history flushes in the same order
+        // as their in-memory changes, including requests from different tabs.
+        let _save_guard = self.last_save.lock().await;
         let active_history_id = self
             .state
             .read()
@@ -627,27 +630,29 @@ impl SessionManager {
         let is_active = active_history_id.as_deref() == Some(target_history_id.as_str());
 
         // Shift the active in-memory track if applicable.
-        if is_active {
+        let active_track = if is_active {
             let mut subs = self.subtitles.write().await;
             if let Some(track) = subs.as_mut() {
-                let delta = absolute_offset_ms - track.offset_ms;
+                let delta = absolute_offset_ms.saturating_sub(track.offset_ms);
                 track.shift_by(delta);
             }
-        }
+            subs.clone()
+        } else {
+            None
+        };
 
         // Shift the cached history copy too, so future re-loads/mining match.
-        {
+        let track_to_save = {
             let mut subtitle_history = self.subtitle_history.write().await;
             if let Some(track) = subtitle_history.get_mut(&target_history_id) {
-                let delta = absolute_offset_ms - track.offset_ms;
+                let delta = absolute_offset_ms.saturating_sub(track.offset_ms);
                 track.shift_by(delta);
-            } else if is_active {
+            } else if let Some(track) = active_track {
                 // Snapshot the active track into history so the offset survives.
-                if let Some(track) = self.subtitles.read().await.clone() {
-                    subtitle_history.insert(target_history_id.clone(), track);
-                }
+                subtitle_history.insert(target_history_id.clone(), track);
             }
-        }
+            subtitle_history.get(&target_history_id).cloned()
+        };
 
         if is_active {
             let mut state = self.state.write().await;
@@ -659,8 +664,13 @@ impl SessionManager {
             let _ = self.state_tx.send(snapshot);
         }
 
-        // Persist (force=true → writes both history + subtitle_history maps).
-        self.save_history(true).await;
+        // A timing nudge changes one track. Saving the entire history here makes
+        // each 100 ms click slower as the user's library grows.
+        if let Some(track) = track_to_save {
+            self.db
+                .save_subtitle_track(target_history_id, track)
+                .await?;
+        }
 
         Ok(absolute_offset_ms)
     }

@@ -146,6 +146,12 @@ This discovery uses the administrator-only `/api/sessions` endpoint, so the conf
 
 ## How it works
 
+Subtitle timing adjustments in the timeline take effect immediately. Rapid nudges
+are combined before Nagare saves the resulting offset for that item. Jellyfin's
+session data does not include mpv's local subtitle delay, so a server-hosted
+Nagare cannot automatically follow mpv-shim's delay without a helper on the
+playback machine.
+
 1. Nagare polls your media server(s) for active playback sessions
 2. Select a session or let Nagare choose automatically and stay with that playback
 3. Create a card in Anki — Nagare matches it to the exact subtitle context

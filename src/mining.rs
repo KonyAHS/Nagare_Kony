@@ -213,6 +213,34 @@ impl AppDatabase {
         Ok(())
     }
 
+    /// Persist one adjusted subtitle track without serializing every saved item.
+    pub async fn save_subtitle_track(
+        &self,
+        history_id: String,
+        track: SubtitleTrack,
+    ) -> anyhow::Result<()> {
+        let db_path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&db_path)?;
+            conn.execute(
+                "INSERT INTO subtitle_tracks (history_id, track_json, updated_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(history_id) DO UPDATE SET
+                     track_json = excluded.track_json,
+                     updated_at = excluded.updated_at",
+                params![
+                    history_id,
+                    serde_json::to_string(&track)?,
+                    Utc::now().to_rfc3339()
+                ],
+            )?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("SQLite subtitle save task failed")??;
+        Ok(())
+    }
+
     pub async fn upsert_mined_note(&self, entry: MiningHistoryEntry) -> anyhow::Result<()> {
         let db_path = self.db_path.clone();
         tokio::task::spawn_blocking(move || upsert_mined_note_sync(&db_path, entry))
@@ -2484,15 +2512,57 @@ fn parse_timestamp(raw: &str) -> Result<DateTime<Utc>, std::io::Error> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decline_tadoku_candidates_sync, list_tadoku_candidates_sync, open_connection,
-        prepare_tadoku_batches_sync, prepare_tadoku_batches_with_policy_sync,
-        save_session_history_sync, set_tadoku_candidate_title_sync,
+        AppDatabase, decline_tadoku_candidates_sync, list_tadoku_candidates_sync,
+        load_subtitle_map, open_connection, prepare_tadoku_batches_sync,
+        prepare_tadoku_batches_with_policy_sync, save_session_history_sync,
+        set_tadoku_candidate_title_sync,
     };
     use crate::config::MediaServerKind;
     use crate::session::HistoryEntry;
+    use crate::subtitle::{SubtitleLine, SubtitleTrack};
     use chrono::{Duration, Utc};
     use rusqlite::params;
     use std::collections::{HashMap, HashSet};
+    use std::fs;
+
+    #[tokio::test]
+    async fn saving_one_subtitle_offset_preserves_other_tracks() {
+        let path = std::env::temp_dir().join(format!(
+            "nagare-subtitle-offset-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let db = AppDatabase::new(path.clone(), None).await.unwrap();
+        let original = SubtitleTrack {
+            lines: vec![SubtitleLine {
+                index: 0,
+                start_ms: 1_000,
+                end_ms: 2_000,
+                text: "line".into(),
+            }],
+            offset_ms: 0,
+        };
+        let mut shifted = original.clone();
+        db.save_subtitle_track("first".into(), original.clone())
+            .await
+            .unwrap();
+        db.save_subtitle_track("second".into(), original)
+            .await
+            .unwrap();
+        shifted.shift_by(100);
+        db.save_subtitle_track("first".into(), shifted)
+            .await
+            .unwrap();
+
+        let conn = open_connection(&path).unwrap();
+        let tracks = load_subtitle_map(&conn).unwrap();
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks["first"].offset_ms, 100);
+        assert_eq!(tracks["first"].lines[0].start_ms, 1_100);
+        assert_eq!(tracks["second"].offset_ms, 0);
+        assert_eq!(tracks["second"].lines[0].start_ms, 1_000);
+        drop(conn);
+        fs::remove_file(path).unwrap();
+    }
 
     fn history_entry(id: &str, series: &str, position_ms: i64) -> HistoryEntry {
         HistoryEntry {
